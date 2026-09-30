@@ -74,20 +74,24 @@ const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match dotenvy::dotenv() {
-        Ok(path) => tracing::info!("Loaded environment from {}", path.display()),
-        Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(".env file not found, using environment variables only");
-        }
-        Err(e) => tracing::warn!("Failed to load .env file: {}", e),
-    }
-    env_config::log_env_config();
+    // Load .env before anything reads the environment. The tracing subscriber
+    // does not exist yet, so keep the outcome and log it once logging is up;
+    // a present-but-malformed file aborts startup right here instead of
+    // letting the server run with partial configuration.
+    let dotenv_status =
+        env_config::load_dotenv().context("Failed to load .env - refusing to start")?;
 
-    env_config::validate_env()
-        .context("Environment validation failed - please check your configuration")?;
+    env_config::validate_env().with_context(|| {
+        format!(
+            "Environment validation failed - please check your configuration ({})",
+            dotenv_status.describe()
+        )
+    })?;
 
     let _tracing_guard =
         payraider_backend::observability::tracing::init_tracing("payraider-backend")?;
+    env_config::log_dotenv_status(&dotenv_status);
+    env_config::log_env_config();
     payraider_backend::observability::metrics::init_metrics();
     tracing::info!(
         instance_id = instance_id(),
