@@ -1,9 +1,5 @@
 use anyhow::Context;
 use axum::{
-    http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderValue, Method,
-    },
     middleware,
     routing::{get, post},
     Router,
@@ -16,7 +12,6 @@ use tower_http::{
         predicate::{NotForContentType, Predicate, SizeAbove},
         CompressionLayer, CompressionLevel,
     },
-    cors::{AllowOrigin, CorsLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -26,6 +21,7 @@ use payraider_backend::{
     api::v1::routes,
     backup::{BackupConfig, BackupManager},
     cache::{CacheConfig, CacheManager},
+    cors::{build_cors_layer, DEFAULT_ALLOWED_ORIGINS},
     database::{Database, PoolConfig},
     distributed_lock::{instance_id, DistributedLock},
     env_config,
@@ -45,7 +41,7 @@ use payraider_backend::{
     observability::metrics as obs_metrics,
     observability::tracing::trace_propagation_middleware,
     rate_limit::RateLimiter,
-    request_id::{request_id_middleware, CORRELATION_ID_HEADER, REQUEST_ID_HEADER},
+    request_id::request_id_middleware,
     rpc::StellarRpcClient,
     services::{
         event_indexer::EventIndexer, service_container::ServiceContainer,
@@ -523,71 +519,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // CORS configuration
-    let allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let wildcard_origins = allowed_origins.trim() == "*";
-
-    // Security: reject wildcard origins in production (non-mock mode)
-    if wildcard_origins && !mock_mode {
-        anyhow::bail!(
-            "CORS: wildcard origin ('*') is not permitted in production. \
-            Set CORS_ALLOWED_ORIGINS to comma-separated list of actual frontend domains. \
-            Example: https://payraider.com,https://app.payraider.com"
-        );
-    }
-
-    let origins: Vec<HeaderValue> = allowed_origins
-        .split(',')
-        .filter_map(|origin| {
-            let trimmed = origin.trim();
-            if trimmed == "*" {
-                return None;
-            }
-            match trimmed.parse::<HeaderValue>() {
-                Ok(value) => {
-                    tracing::info!("CORS: allowing origin '{}'", trimmed);
-                    Some(value)
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "CORS: skipping invalid origin '{}' — check CORS_ALLOWED_ORIGINS",
-                        trimmed
-                    );
-                    None
-                }
-            }
-        })
-        .collect();
-
-    if origins.is_empty() && !wildcard_origins {
-        tracing::warn!(
-            "CORS: no valid origins parsed from CORS_ALLOWED_ORIGINS='{}'. \
-             All cross-origin requests will be rejected.",
-            allowed_origins
-        );
-    }
-
-    let allow_origin = if wildcard_origins {
-        tracing::info!("CORS: wildcard origin configured (dev/mock mode only); mirroring request origin");
-        AllowOrigin::mirror_request()
-    } else {
-        AllowOrigin::list(origins)
-    };
-
-    let cors = CorsLayer::new()
-        .allow_origin(allow_origin)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([
-            CONTENT_TYPE,
-            AUTHORIZATION,
-            REQUEST_ID_HEADER.clone(),
-            CORRELATION_ID_HEADER.clone(),
-        ])
-        // Let browser clients read the IDs so they can be quoted in bug reports.
-        .expose_headers([REQUEST_ID_HEADER.clone(), CORRELATION_ID_HEADER.clone()])
-        .allow_credentials(true)
-        .max_age(Duration::from_secs(3600));
+    // CORS: allow-list from CORS_ALLOWED_ORIGINS (see `cors` module). A wildcard
+    // is only accepted in mock mode; production startup fails on it.
+    let cors_origins = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| DEFAULT_ALLOWED_ORIGINS.to_string());
+    let cors = build_cors_layer(&cors_origins, mock_mode)?;
 
     // Compression configuration
     let compression_min_size: u16 = std::env::var("COMPRESSION_MIN_SIZE")
